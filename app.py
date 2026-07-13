@@ -13,7 +13,7 @@ KEYWORDS = ["devops", "kubernetes", "terraform", "aws", "ci/cd", "docker", "eks"
 MAX_PROPOSALS = int(os.environ.get("MAX_PROPOSALS", 5))
 SEEN_FILE = "/data/seen_jobs.json"
 JOBS_FILE = "/data/jobs.json"
-SEARCH_URL = "https://www.upwork.com/nx/search/jobs/?q=devops&sort=recency"
+SEARCH_URL = "https://www.upwork.com/nx/find-work/most-recent"
 SMTP_USER = os.environ["SMTP_USER"]
 SMTP_PASS = os.environ["SMTP_PASS"]
 NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
