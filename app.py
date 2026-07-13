@@ -13,7 +13,8 @@ KEYWORDS = ["devops", "kubernetes", "terraform", "aws", "ci/cd", "docker", "eks"
 MAX_PROPOSALS = int(os.environ.get("MAX_PROPOSALS", 5))
 SEEN_FILE = "/data/seen_jobs.json"
 JOBS_FILE = "/data/jobs.json"
-SEARCH_URL = "https://www.upwork.com/nx/find-work/most-recent"
+SEARCH_URL = "https://www.upwork.com/nx/search/jobs/?q=devops&sort=recency"
+COOKIES_FILE = "/cookies/cookies.json"
 SMTP_USER = os.environ["SMTP_USER"]
 SMTP_PASS = os.environ["SMTP_PASS"]
 NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
@@ -106,9 +107,31 @@ async def scrape():
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        page = await browser.new_page(
+        context = await browser.new_context(
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
         )
+        if os.path.exists(COOKIES_FILE):
+            with open(COOKIES_FILE) as f:
+                raw = json.load(f)
+            # normalize cookie-editor format to playwright format
+            cookies = []
+            for c in raw:
+                cookie = {
+                    "name": c["name"],
+                    "value": c["value"],
+                    "domain": c.get("domain", ".upwork.com"),
+                    "path": c.get("path", "/"),
+                    "secure": c.get("secure", False),
+                    "httpOnly": c.get("httpOnly", False),
+                }
+                if c.get("expirationDate"):
+                    cookie["expires"] = int(c["expirationDate"])
+                cookies.append(cookie)
+            await context.add_cookies(cookies)
+            print("Cookies loaded")
+        else:
+            print("WARNING: No cookies file found, may hit captcha")
+        page = await context.new_page()
         await page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
         await page.wait_for_timeout(3000)
 
@@ -145,6 +168,7 @@ async def scrape():
                     "seen_at": datetime.now().strftime("%Y-%m-%d %H:%M")
                 })
 
+        await context.close()
         await browser.close()
 
     if matches:
