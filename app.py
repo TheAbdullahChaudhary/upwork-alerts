@@ -4,17 +4,17 @@ import os
 import smtplib
 import re
 import threading
+import requests
 from datetime import datetime
 from email.mime.text import MIMEText
 from flask import Flask, jsonify, render_template_string
-from playwright.async_api import async_playwright
 
 KEYWORDS = ["devops", "kubernetes", "terraform", "aws", "ci/cd", "docker", "eks"]
 MAX_PROPOSALS = int(os.environ.get("MAX_PROPOSALS", 5))
 SEEN_FILE = "/data/seen_jobs.json"
 JOBS_FILE = "/data/jobs.json"
-SEARCH_URL = "https://www.upwork.com/nx/search/jobs/?q=devops&sort=recency"
 COOKIES_FILE = "/cookies/cookies.json"
+SEARCH_URL = "https://www.upwork.com/nx/search/jobs/?q=devops&sort=recency"
 SMTP_USER = os.environ["SMTP_USER"]
 SMTP_PASS = os.environ["SMTP_PASS"]
 NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
@@ -100,92 +100,104 @@ def send_email(jobs):
         print(f"Email error: {e}")
 
 
-async def scrape():
+def load_cookies():
+    if not os.path.exists(COOKIES_FILE):
+        return {}
+    with open(COOKIES_FILE) as f:
+        raw = json.load(f)
+    return {c["name"]: c["value"] for c in raw}
+
+
+def scrape():
     seen = set(load_json(SEEN_FILE, []))
     existing_jobs = load_json(JOBS_FILE, [])
     matches = []
+    new_seen = set(seen)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+    cookies = load_cookies()
+    xsrf = cookies.get("XSRF-TOKEN", "")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-Upwork-Accept-Language": "en-US",
+        "Referer": "https://www.upwork.com/nx/search/jobs/",
+        "X-XSRF-TOKEN": xsrf,
+    }
+
+    params = {
+        "q": "devops",
+        "sort": "recency",
+        "paging": "0;50",
+    }
+
+    try:
+        resp = requests.get(
+            "https://www.upwork.com/search/jobs/url",
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            timeout=20
         )
-        if os.path.exists(COOKIES_FILE):
-            with open(COOKIES_FILE) as f:
-                raw = json.load(f)
-            # normalize cookie-editor format to playwright format
-            cookies = []
-            for c in raw:
-                cookie = {
-                    "name": c["name"],
-                    "value": c["value"],
-                    "domain": c.get("domain", ".upwork.com"),
-                    "path": c.get("path", "/"),
-                    "secure": c.get("secure", False),
-                    "httpOnly": c.get("httpOnly", False),
-                }
-                if c.get("expirationDate"):
-                    cookie["expires"] = int(c["expirationDate"])
-                cookies.append(cookie)
-            await context.add_cookies(cookies)
-            print("Cookies loaded")
-        else:
-            print("WARNING: No cookies file found, may hit captcha")
-        page = await context.new_page()
-        await page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
-        await page.wait_for_timeout(3000)
+        print(f"[{datetime.now()}] API status: {resp.status_code}")
 
-        cards = await page.query_selector_all("article, section[data-test='job-tile']")
-        print(f"[{datetime.now()}] Found {len(cards)} cards")
-        new_seen = set(seen)
+        if resp.status_code != 200:
+            # fallback: try the jobs search API
+            resp = requests.get(
+                "https://www.upwork.com/ab/jobs/search/",
+                params=params,
+                headers=headers,
+                cookies=cookies,
+                timeout=20
+            )
+            print(f"[{datetime.now()}] Fallback status: {resp.status_code}")
 
-        for card in cards:
-            text = (await card.inner_text()).lower()
-            link_el = await card.query_selector("a[href*='/jobs/']")
-            link = await link_el.get_attribute("href") if link_el else ""
-            if link and not link.startswith("http"):
-                link = "https://www.upwork.com" + link
+        data = resp.json()
+        jobs_list = data.get("results", data.get("jobs", []))
+        print(f"[{datetime.now()}] Found {len(jobs_list)} jobs from API")
 
-            job_id = link or text[:80]
-            if job_id in seen:
-                continue
-            new_seen.add(job_id)
+    except Exception as e:
+        print(f"[{datetime.now()}] API error: {e}")
+        jobs_list = []
 
-            if not any(k in text for k in KEYWORDS):
-                continue
+    for job in jobs_list:
+        job_id = job.get("id") or job.get("uid") or str(job)[:80]
+        if job_id in seen:
+            continue
+        new_seen.add(job_id)
 
-            p = re.search(r'proposals?.*?(\d+)', text, re.IGNORECASE) or \
-                re.search(r'(\d+)\s+proposals?', text, re.IGNORECASE)
-            proposals = int(p.group(1)) if p else None
+        title = job.get("title", "DevOps Job")
+        if not any(k in title.lower() for k in KEYWORDS):
+            continue
 
-            if proposals is None or proposals < MAX_PROPOSALS:
-                title_el = await card.query_selector("h2, h3, [data-test='job-tile-title']")
-                title = (await title_el.inner_text()).strip() if title_el else "DevOps Job"
-                matches.append({
-                    "title": title,
-                    "link": link,
-                    "proposals": proposals,
-                    "seen_at": datetime.now().strftime("%Y-%m-%d %H:%M")
-                })
+        proposals = job.get("proposals_count") or job.get("proposalsTier") or None
+        if isinstance(proposals, str):
+            m = re.search(r'\d+', proposals)
+            proposals = int(m.group()) if m else None
 
-        await context.close()
-        await browser.close()
+        if proposals is None or proposals < MAX_PROPOSALS:
+            cid = job.get("ciphertext") or job.get("id", "")
+            link = f"https://www.upwork.com/jobs/{cid}" if cid else "https://www.upwork.com/nx/search/jobs/?q=devops"
+            matches.append({
+                "title": title,
+                "link": link,
+                "proposals": proposals,
+                "seen_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+            })
 
     if matches:
         send_email(matches)
-        all_jobs = matches + existing_jobs
-        save_json(JOBS_FILE, all_jobs[:200])  # keep latest 200
+        save_json(JOBS_FILE, (matches + existing_jobs)[:200])
 
     save_json(SEEN_FILE, list(new_seen)[-500:])
     print(f"[{datetime.now()}] New matches: {len(matches)}")
 
 
 def run_loop():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     while True:
         try:
-            loop.run_until_complete(scrape())
+            scrape()
         except Exception as e:
             print(f"Scrape error: {e}")
         import time; time.sleep(CHECK_INTERVAL)

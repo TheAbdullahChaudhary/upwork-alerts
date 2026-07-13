@@ -1,10 +1,9 @@
-FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
+FROM python:3.11-slim
 
 WORKDIR /app
 COPY app.py .
 
-RUN pip install --no-cache-dir flask playwright && \
-    playwright install chromium
+RUN pip install --no-cache-dir flask requests
 
 VOLUME ["/data"]
 EXPOSE 5000
