@@ -11,6 +11,7 @@ from playwright.async_api import async_playwright
 
 KEYWORDS = ["devops", "kubernetes", "terraform", "aws", "ci/cd", "docker", "eks"]
 MAX_CONNECTS = int(os.environ.get("MAX_CONNECTS", 5))
+MAX_PROPOSALS = int(os.environ.get("MAX_PROPOSALS", 5))
 SEEN_FILE = "/data/seen_jobs.json"
 JOBS_FILE = "/data/jobs.json"
 SEARCH_URL = "https://www.upwork.com/nx/search/jobs/?q=devops&sort=recency"
@@ -45,7 +46,7 @@ HTML = """<!DOCTYPE html>
 </head>
 <body>
   <h1>🚀 Upwork Job Alerts</h1>
-  <p class="meta">DevOps jobs with &lt; {{ max_connects }} connects &nbsp;·&nbsp; Auto-refreshes every 60s</p>
+  <p class="meta">DevOps jobs with &lt; {{ max_connects }} connects &amp; &lt; {{ max_proposals }} proposals &nbsp;·&nbsp; Auto-refreshes every 60s</p>
   {% if jobs %}
   <div class="grid">
     {% for job in jobs %}
@@ -54,6 +55,11 @@ HTML = """<!DOCTYPE html>
         <span class="badge">{{ job.connects }} connects</span>
       {% else %}
         <span class="badge unknown">connects unknown</span>
+      {% endif %}
+      {% if job.proposals != None %}
+        <span class="badge" style="background:#0077b6">{{ job.proposals }} proposals</span>
+      {% else %}
+        <span class="badge unknown">proposals unknown</span>
       {% endif %}
       <h3>{{ job.title }}</h3>
       <a href="{{ job.link }}" target="_blank">View on Upwork →</a>
@@ -134,13 +140,21 @@ async def scrape():
             m = re.search(r'(\d+)\s+connects', text, re.IGNORECASE)
             connects = int(m.group(1)) if m else None
 
-            if connects is None or connects < MAX_CONNECTS:
+            p = re.search(r'proposals?.*?(\d+)', text, re.IGNORECASE) or \
+                re.search(r'(\d+)\s+proposals?', text, re.IGNORECASE)
+            proposals = int(p.group(1)) if p else None
+
+            connects_ok = connects is None or connects < MAX_CONNECTS
+            proposals_ok = proposals is None or proposals < MAX_PROPOSALS
+
+            if connects_ok and proposals_ok:
                 title_el = await card.query_selector("h2, h3, [data-test='job-tile-title']")
                 title = (await title_el.inner_text()).strip() if title_el else "DevOps Job"
                 matches.append({
                     "title": title,
                     "link": link,
                     "connects": connects,
+                    "proposals": proposals,
                     "seen_at": datetime.now().strftime("%Y-%m-%d %H:%M")
                 })
 
@@ -169,7 +183,7 @@ def run_loop():
 @app.route("/")
 def index():
     jobs = load_json(JOBS_FILE, [])
-    return render_template_string(HTML, jobs=jobs, max_connects=MAX_CONNECTS, interval=CHECK_INTERVAL)
+    return render_template_string(HTML, jobs=jobs, max_connects=MAX_CONNECTS, max_proposals=MAX_PROPOSALS, interval=CHECK_INTERVAL)
 
 
 @app.route("/api/jobs")
