@@ -5,6 +5,7 @@ import smtplib
 import re
 import threading
 import requests
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from email.mime.text import MIMEText
 from flask import Flask, jsonify, render_template_string
@@ -13,8 +14,7 @@ KEYWORDS = ["devops", "kubernetes", "terraform", "aws", "ci/cd", "docker", "eks"
 MAX_PROPOSALS = int(os.environ.get("MAX_PROPOSALS", 5))
 SEEN_FILE = "/data/seen_jobs.json"
 JOBS_FILE = "/data/jobs.json"
-COOKIES_FILE = "/cookies/cookies.json"
-SEARCH_URL = "https://www.upwork.com/nx/search/jobs/?q=devops&sort=recency"
+RSS_URL = "https://www.upwork.com/ab/feed/jobs/rss?q=devops&sort=recency&paging=0%3B50"
 SMTP_USER = os.environ["SMTP_USER"]
 SMTP_PASS = os.environ["SMTP_PASS"]
 NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
@@ -100,85 +100,43 @@ def send_email(jobs):
         print(f"Email error: {e}")
 
 
-def load_cookies():
-    if not os.path.exists(COOKIES_FILE):
-        return {}
-    with open(COOKIES_FILE) as f:
-        raw = json.load(f)
-    return {c["name"]: c["value"] for c in raw}
-
-
 def scrape():
     seen = set(load_json(SEEN_FILE, []))
     existing_jobs = load_json(JOBS_FILE, [])
     matches = []
     new_seen = set(seen)
 
-    cookies = load_cookies()
-    xsrf = cookies.get("XSRF-TOKEN", "")
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "X-Requested-With": "XMLHttpRequest",
-        "X-Upwork-Accept-Language": "en-US",
-        "Referer": "https://www.upwork.com/nx/search/jobs/",
-        "X-XSRF-TOKEN": xsrf,
-    }
-
-    params = {
-        "q": "devops",
-        "sort": "recency",
-        "paging": "0;50",
-    }
-
     try:
         resp = requests.get(
-            "https://www.upwork.com/search/jobs/url",
-            params=params,
-            headers=headers,
-            cookies=cookies,
+            RSS_URL,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
             timeout=20
         )
-        print(f"[{datetime.now()}] API status: {resp.status_code}")
-
-        if resp.status_code != 200:
-            # fallback: try the jobs search API
-            resp = requests.get(
-                "https://www.upwork.com/ab/jobs/search/",
-                params=params,
-                headers=headers,
-                cookies=cookies,
-                timeout=20
-            )
-            print(f"[{datetime.now()}] Fallback status: {resp.status_code}")
-
-        data = resp.json()
-        jobs_list = data.get("results", data.get("jobs", []))
-        print(f"[{datetime.now()}] Found {len(jobs_list)} jobs from API")
-
+        print(f"[{datetime.now()}] RSS status: {resp.status_code}")
+        root = ET.fromstring(resp.content)
+        items = root.findall(".//item")
+        print(f"[{datetime.now()}] Found {len(items)} RSS items")
     except Exception as e:
-        print(f"[{datetime.now()}] API error: {e}")
-        jobs_list = []
+        print(f"[{datetime.now()}] RSS error: {e}")
+        items = []
 
-    for job in jobs_list:
-        job_id = job.get("id") or job.get("uid") or str(job)[:80]
+    for item in items:
+        link = (item.findtext("link") or "").strip()
+        title = (item.findtext("title") or "DevOps Job").strip()
+        description = (item.findtext("description") or "").lower()
+
+        job_id = link or title
         if job_id in seen:
             continue
         new_seen.add(job_id)
 
-        title = job.get("title", "DevOps Job")
-        if not any(k in title.lower() for k in KEYWORDS):
+        if not any(k in title.lower() or k in description for k in KEYWORDS):
             continue
 
-        proposals = job.get("proposals_count") or job.get("proposalsTier") or None
-        if isinstance(proposals, str):
-            m = re.search(r'\d+', proposals)
-            proposals = int(m.group()) if m else None
+        m = re.search(r'proposals?[:\s]+(\d+)', description, re.IGNORECASE)
+        proposals = int(m.group(1)) if m else None
 
         if proposals is None or proposals < MAX_PROPOSALS:
-            cid = job.get("ciphertext") or job.get("id", "")
-            link = f"https://www.upwork.com/jobs/{cid}" if cid else "https://www.upwork.com/nx/search/jobs/?q=devops"
             matches.append({
                 "title": title,
                 "link": link,
